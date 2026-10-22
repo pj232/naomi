@@ -10,6 +10,7 @@ import hmac
 import json
 import os
 import random
+import re
 import sqlite3
 from collections import defaultdict
 from contextlib import contextmanager
@@ -19,6 +20,44 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Suivi de chantier", page_icon="🏗️", layout="centered")
+
+# Palette : marine #0F2B46, bleu #1D4ED8, orange #C2410C / #F97316 sur fond clair #F4F7FB.
+# Tous les couples texte/fond ont un contraste >= 4,5:1 (norme WCAG AA).
+STYLE = """
+<style>
+.stApp { background: #F4F7FB; }
+.stApp, .stApp p, .stApp label, .stApp li { color: #0F172A; }
+h1, h2, h3 { color: #0F2B46 !important; font-weight: 800 !important; }
+h2 { border-left: 8px solid #F97316; padding-left: .6rem !important; }
+.hero { background: linear-gradient(135deg, #0F2B46 0%, #1D4ED8 100%); border-radius: 16px;
+        padding: 1.4rem 1.3rem; margin-bottom: 1rem; box-shadow: 0 6px 18px rgba(15,43,70,.25); }
+.hero h1 { color: #FFFFFF !important; margin: 0; font-size: 1.8rem; padding: 0; }
+.hero p { color: #FFFFFF !important; margin: .4rem 0 0 0; font-size: 1.02rem; }
+.stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button {
+  background: linear-gradient(135deg, #9A3412, #C2410C); color: #FFFFFF !important; border: 0;
+  border-radius: 10px; font-weight: 700; padding: .55rem 1.1rem; }
+.stButton > button p, .stDownloadButton > button p, [data-testid="stFormSubmitButton"] > button p {
+  color: #FFFFFF !important; font-weight: 700; }
+.stButton > button:hover, .stDownloadButton > button:hover,
+[data-testid="stFormSubmitButton"] > button:hover { filter: brightness(1.15); transform: translateY(-1px); }
+[data-testid="stMetric"] { background: #FFFFFF; border: 1px solid #D6E0EE; border-left: 6px solid #F97316;
+  border-radius: 12px; padding: .8rem 1rem; box-shadow: 0 2px 8px rgba(15,43,70,.08); }
+[data-testid="stMetricLabel"] p { color: #334155 !important; font-weight: 600; }
+[data-testid="stMetricValue"] { color: #0F2B46 !important; font-weight: 800; }
+[data-testid="stForm"], [data-testid="stExpander"] { background: #FFFFFF; border: 1px solid #D6E0EE;
+  border-radius: 14px; box-shadow: 0 2px 8px rgba(15,43,70,.06); }
+.stTabs [data-baseweb="tab"] { font-weight: 700; font-size: 1.05rem; }
+.stTabs [data-baseweb="tab"] p { color: #0F2B46 !important; }
+.stTabs [aria-selected="true"] p { color: #C2410C !important; }
+[data-testid="stSidebar"] { background: linear-gradient(180deg, #0F2B46 0%, #1E3A8A 100%); }
+[data-testid="stSidebar"] * { color: #FFFFFF !important; }
+</style>
+"""
+st.markdown(STYLE, unsafe_allow_html=True)
+
+# Code à fournir pour créer un compte PDG / administrateur (à changer : variable CODE_ADMIN).
+CODE_ADMIN = os.environ.get("CODE_ADMIN", "BTP-2026")
+IDENTIFIANT_VALIDE = re.compile(r"^[A-Za-z0-9._-]{3,30}$")
 
 
 # =============================================================================
@@ -226,7 +265,11 @@ def _egal(a, b) -> bool:
 
 def _journaliser(con, utilisateur, table, ancienne, nouvelle):
     def enc(v):
-        return None if v is None else json.dumps(v, default=str, ensure_ascii=False)
+        if v is None:
+            return None
+        if isinstance(v, dict) and "mot_de_passe" in v:
+            v = {**v, "mot_de_passe": "***"}
+        return json.dumps(v, default=str, ensure_ascii=False)
 
     con.execute("INSERT INTO journal (utilisateur, table_nom, ancienne_valeur, nouvelle_valeur) "
                 "VALUES (?, ?, ?, ?)", (utilisateur, table, enc(ancienne), enc(nouvelle)))
@@ -497,9 +540,38 @@ def fiche_pdf(ligne, jours_df: pd.DataFrame, lundi: date, chantier: str) -> byte
 # =============================================================================
 # Connexion
 # =============================================================================
-def page_connexion():
-    st.title("🏗️ Suivi des heures et salaires")
-    st.caption("Application de gestion des ouvriers de chantier")
+def valider_inscription(nom, ident, mdp, mdp2, role, chantier_id, code) -> list:
+    """Retourne la liste des erreurs de saisie (liste vide si tout est correct)."""
+    erreurs = []
+    if len(nom.strip()) < 2:
+        erreurs.append("Le nom complet est obligatoire (2 caractères minimum).")
+    ident = ident.strip().lower()
+    if not IDENTIFIANT_VALIDE.match(ident):
+        erreurs.append("Identifiant : 3 à 30 caractères (lettres, chiffres, point, tiret, souligné).")
+    elif ident in set(lire("utilisateurs")["identifiant"].str.lower()):
+        erreurs.append("Cet identifiant est déjà utilisé.")
+    if len(mdp) < 6:
+        erreurs.append("Le mot de passe doit contenir au moins 6 caractères.")
+    elif mdp != mdp2:
+        erreurs.append("Les deux mots de passe ne sont pas identiques.")
+    if role == "chef" and chantier_id is None:
+        erreurs.append("Choisissez votre chantier (aucun chantier n'existe encore ?).")
+    if role == "pdg" and code != CODE_ADMIN:
+        erreurs.append("Code administrateur incorrect.")
+    return erreurs
+
+
+def creer_compte(nom, ident, mdp, role, chantier_id) -> dict:
+    """Crée le compte et retourne la ligne de l'utilisateur (pour la connexion automatique)."""
+    ident = ident.strip().lower()
+    inserer("utilisateurs", {"nom": nom.strip(), "role": role, "identifiant": ident,
+                             "mot_de_passe": hash_mdp(mdp),
+                             "chantier_id": chantier_id if role == "chef" else None}, ident)
+    users = lire("utilisateurs")
+    return users[users["identifiant"] == ident].iloc[0].to_dict()
+
+
+def formulaire_connexion():
     with st.form("connexion"):
         ident = st.text_input("Identifiant")
         mdp = st.text_input("Mot de passe", type="password")
@@ -509,7 +581,7 @@ def page_connexion():
             st.error("Veuillez saisir l'identifiant et le mot de passe.")
             return
         users = lire("utilisateurs")
-        ligne = users[users["identifiant"] == ident.strip()]
+        ligne = users[users["identifiant"].str.lower() == ident.strip().lower()]
         if ligne.empty or not verifier_mdp(mdp, ligne.iloc[0]["mot_de_passe"]):
             st.error("Identifiant ou mot de passe incorrect.")
             return
@@ -519,9 +591,62 @@ def page_connexion():
             "et **chef / chef123** (chef de chantier).")
 
 
+def formulaire_inscription():
+    role_txt = st.radio("Je m'inscris en tant que",
+                        ["Chef de chantier", "PDG / administrateur"], horizontal=True)
+    role = "chef" if role_txt == "Chef de chantier" else "pdg"
+    chantiers = lire("chantiers")
+    noms = dict(zip(chantiers["id"].astype(int), chantiers["nom"]))
+    with st.form("inscription"):
+        nom = st.text_input("Nom complet")
+        ident = st.text_input("Identifiant de connexion", help="3 à 30 caractères, sans espace")
+        mdp = st.text_input("Mot de passe (6 caractères minimum)", type="password")
+        mdp2 = st.text_input("Confirmer le mot de passe", type="password")
+        chantier_id, code = None, ""
+        if role == "chef":
+            if noms:
+                chantier_id = int(st.selectbox("Mon chantier", list(noms), format_func=noms.get))
+            else:
+                st.warning("Aucun chantier n'existe encore : un PDG doit d'abord s'inscrire.")
+        else:
+            code = st.text_input("Code administrateur", type="password")
+        ok = st.form_submit_button("Créer mon compte", type="primary")
+    if ok:
+        erreurs = valider_inscription(nom, ident, mdp, mdp2, role, chantier_id, code)
+        if erreurs:
+            for e in erreurs:
+                st.error(e)
+            return
+        try:
+            st.session_state["user"] = creer_compte(nom, ident, mdp, role, chantier_id)
+        except sqlite3.IntegrityError:
+            st.error("Cet identifiant est déjà utilisé.")
+            return
+        st.rerun()
+
+
+def page_connexion():
+    st.markdown('<div class="hero"><h1>🏗️ Suivi des heures et salaires</h1>'
+                '<p>Présence, heures, paie et alertes de vos chantiers, en un coup d\'œil.</p></div>',
+                unsafe_allow_html=True)
+    onglet_connexion, onglet_inscription = st.tabs(["🔑 Se connecter", "📝 S'inscrire"])
+    with onglet_connexion:
+        formulaire_connexion()
+    with onglet_inscription:
+        formulaire_inscription()
+
+
 # =============================================================================
 # Tableau de bord (PDG)
 # =============================================================================
+def colorer_cellule(valeur) -> str:
+    if valeur == "Absent":
+        return "background-color:#FEE2E2;color:#991B1B;font-weight:600"
+    if valeur == "—":
+        return "background-color:#E2E8F0;color:#334155"
+    return "background-color:#DCFCE7;color:#14532D;font-weight:600"
+
+
 def page_dashboard():
     st.header("Tableau de bord")
     prm = params()
@@ -556,16 +681,22 @@ def page_dashboard():
                 else:
                     ligne[etiquette] = "—" if j.weekday() == 6 else "Absent"
             lignes[o.nom] = ligne
-        st.dataframe(pd.DataFrame(lignes).T, use_container_width=True)
+        grille = pd.DataFrame(lignes).T
+        try:  # présent = vert, absent = rouge, dimanche = gris
+            styler = grille.style
+            styler = styler.map(colorer_cellule) if hasattr(styler, "map") else styler.applymap(colorer_cellule)
+            st.dataframe(styler, use_container_width=True)
+        except Exception:
+            st.dataframe(grille, use_container_width=True)
 
     st.subheader("Coût salarial par semaine")
     toutes = paie_df(pointages_calcules(ch_id), prm)
     if toutes.empty:
         st.info("Pas encore de données.")
     else:
-        st.bar_chart(toutes.groupby("semaine")["salaire"].sum())
+        st.bar_chart(toutes.groupby("semaine")["salaire"].sum(), color="#F97316")
         st.subheader("Heures par semaine")
-        st.line_chart(toutes.groupby("semaine")["total_heures"].sum())
+        st.line_chart(toutes.groupby("semaine")["total_heures"].sum(), color="#1D4ED8")
 
 
 # =============================================================================
